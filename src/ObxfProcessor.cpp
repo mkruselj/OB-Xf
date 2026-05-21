@@ -248,6 +248,7 @@ void ObxfAudioProcessor::setCurrentProgram(const int index)
 
     if (index < 0 || index > utils->lastFactoryPatch + 1 ||
         (size_t)index > utils->patchesAsLinearList.size())
+    {
         return;
     }
 
