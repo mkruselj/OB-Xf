@@ -49,8 +49,6 @@ struct AboutScreen;
 struct SaveDialog;
 struct FocusDebugger;
 
-class MPEMatrixEditor;
-
 using KnobAttachment = Attachment<Knob, true>;
 using ButtonAttachment = Attachment<ToggleButton, false>;
 using ButtonListAttachment = Attachment<ButtonList, false>;
@@ -79,7 +77,7 @@ class ObxfAudioProcessorEditor final : public juce::AudioProcessorEditor,
     void scaleFactorChanged();
     void mouseUp(const juce::MouseEvent &e) override;
     void paint(juce::Graphics &g) override;
-    void updateFromHost();
+    void syncUIFromState();
     void handleAsyncUpdate() override;
     void changeListenerCallback(juce::ChangeBroadcaster *source) override;
     void buttonClicked(juce::Button *) override {}
@@ -153,6 +151,9 @@ class ObxfAudioProcessorEditor final : public juce::AudioProcessorEditor,
 
     bool ignoreHostScale{false};
     bool dontParentMenusToEditor{false};
+
+    std::optional<bool> lastFourPole;
+    std::optional<bool> lastXpanderMode;
 
     void initializeEditorCallbacks();
 

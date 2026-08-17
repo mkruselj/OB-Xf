@@ -24,8 +24,21 @@ ParameterUpdateHandler::ParameterUpdateHandler(ObxfAudioProcessor &audioProcesso
                                                const std::vector<ParameterInfo> &_parameters)
     : parameters{_parameters}, audioProcessor{audioProcessor}
 {
+    std::unordered_map<std::string, juce::AudioProcessorParameterGroup *> groupPtrs;
+
+    auto root = std::make_unique<juce::AudioProcessorParameterGroup>("", "", "");
+
     for (const auto &info : parameters)
     {
+        const std::string &gname = info.meta.groupName;
+
+        if (!groupPtrs.count(gname))
+        {
+            auto g = std::make_unique<juce::AudioProcessorParameterGroup>(gname, gname, "|");
+            groupPtrs[gname] = g.get();
+            root->addChild(std::move(g));
+        }
+
         juce::RangedAudioParameter *param = nullptr;
         using Type = sst::basic_blocks::params::ParamMetaData::Type;
 
@@ -43,10 +56,13 @@ ParameterUpdateHandler::ParameterUpdateHandler(ObxfAudioProcessor &audioProcesso
             continue;
         }
 
-        audioProcessor.addParameter(param);
+        groupPtrs[gname]->addChild(std::unique_ptr<juce::RangedAudioParameter>(param));
         paramMap[info.ID] = param;
+        indexToID.push_back(info.ID);
         param->addListener(this);
     }
+
+    audioProcessor.addParameterGroup(std::move(root));
 
     for (auto &p : paramMap)
     {
@@ -61,6 +77,8 @@ ParameterUpdateHandler::ParameterUpdateHandler(ObxfAudioProcessor &audioProcesso
             op->setTempoSyncToggleParam(paramMap[juce::String{SynthParam::ID::LFO2TempoSync}]);
         }
     }
+
+    jassert(ParameterList.size() <= FIFO_SIZE);
 }
 
 ParameterUpdateHandler::~ParameterUpdateHandler()
@@ -73,7 +91,7 @@ ParameterUpdateHandler::~ParameterUpdateHandler()
 
 void ParameterUpdateHandler::parameterValueChanged(int parameterIndex, float newValue)
 {
-    const auto paramID = parameters[parameterIndex].ID;
+    const auto paramID = indexToID[parameterIndex];
     queueParameterChange(paramID, newValue);
 }
 
@@ -155,6 +173,8 @@ void ParameterUpdateHandler::updateParameters(const bool force)
 void ParameterUpdateHandler::forceSingleParameterCallback(const juce::String &paramID,
                                                           float newValue)
 {
+    std::lock_guard<std::mutex> cblg(callbackMutex);
+
     if (auto it = callbacks.find(paramID); it != callbacks.end())
         for (auto &[_, cb] : it->second)
             cb(newValue, true);
@@ -169,7 +189,12 @@ juce::RangedAudioParameter *ParameterUpdateHandler::getParameter(const juce::Str
 
 void ParameterUpdateHandler::queueParameterChange(const juce::String &paramID, float newValue)
 {
-    fifo.pushParameter(paramID, newValue);
+    const auto status = fifo.pushParameter(paramID, newValue);
+
+    if (!status)
+    {
+        OBLOG(params, "Parameter " << paramID << " was not pushed to FIFO queue successfully!");
+    }
 }
 
 void ParameterUpdateHandler::addParameter(const juce::String &paramID,
@@ -188,10 +213,20 @@ void ParameterUpdateHandler::parameterGestureChanged(int idx, bool b)
         auto par = getParameter(id);
         if (par && b)
         {
-            OBLOG(undo, "Value before change was " << par->getValue());
-            undoStack.emplace_back(id.toStdString(), par->getValue());
-            while (undoStack.size() > 50)
-                undoStack.pop_front();
+            auto capturedId = id;
+            float capturedValue = par->getValue();
+
+            OBLOG(undo, "Value before change was " << capturedValue);
+
+            recordUndoableAction([this, capturedId, capturedValue] {
+                juce::ScopedValueSetter<bool> supress(supressGestureToUndo, true);
+                if (auto *p = getParameter(capturedId))
+                {
+                    p->beginChangeGesture();
+                    p->setValueNotifyingHost(capturedValue);
+                    p->endChangeGesture();
+                }
+            });
         }
     }
 }
@@ -199,18 +234,14 @@ void ParameterUpdateHandler::parameterGestureChanged(int idx, bool b)
 void ParameterUpdateHandler::undo()
 {
     if (undoStack.empty())
-        return;
-    auto [id, value] = undoStack.back();
-    undoStack.pop_back();
-    OBLOG(undo, "Undoing change of parameter '" << id << "' to " << value);
-    auto par = getParameter(id);
-    if (par)
     {
-        juce::ScopedValueSetter<bool> supress(supressGestureToUndo, true);
-        par->beginChangeGesture();
-        par->setValueNotifyingHost(value);
-        par->endChangeGesture();
+        return;
     }
+
+    auto entry = std::move(undoStack.back());
+
+    undoStack.pop_back();
+    entry.apply();
 }
 
 void ParameterUpdateHandler::clearFIFO()

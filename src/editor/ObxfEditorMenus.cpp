@@ -19,7 +19,6 @@
 #include "../ObxfEditor.h"
 
 #include "gui/AboutScreen.h"
-#include "gui/MPEMatrix.h"
 #include "gui/MutatorMenu.h"
 #include "gui/SaveDialog.h"
 
@@ -144,18 +143,13 @@ void ObxfAudioProcessorEditor::setupMPEGlideRangeMenu() const
 {
     if (auto *m = getWidget<ButtonList>("mpeGlideRangeMenu"))
     {
-        for (int i = 0; i <= MAX_BEND_RANGE; ++i)
+        for (int i = 0; i <= MAX_MPE_BEND_RANGE; ++i)
         {
             m->addChoice(juce::String(i));
         }
 
-        m->setNumColumns(4);
+        m->setNumColumns(8);
         m->setScrollWheelEnabled(true);
-
-        /*         if (const auto *p = paramCoordinator.getParameter(ID::BendDownRange))
-                {
-                    m->setValue(p->getValue(), juce::dontSendNotification);
-                } */
     }
 }
 
@@ -177,6 +171,31 @@ void ObxfAudioProcessorEditor::setupFilterXpanderModeMenu() const
     }
 }
 
+void ObxfAudioProcessorEditor::setupMPEMatrixMenus() const
+{
+    using namespace SynthParam;
+
+    for (const auto &def : mpeMatrixWidgetDefs)
+    {
+        if (auto *m = getWidget<ButtonList>(def.destWidget))
+        {
+            m->addChoice("None");
+
+            for (const auto &id : matrixCommonTargets())
+            {
+                m->addChoice(id);
+            }
+
+            for (const auto &id : matrixExtraTargets(def.source))
+            {
+                m->addChoice(id);
+            }
+
+            m->setScrollWheelEnabled(true);
+        }
+    }
+}
+
 void ObxfAudioProcessorEditor::setupMenus()
 {
     setupPolyphonyMenu();
@@ -187,6 +206,7 @@ void ObxfAudioProcessorEditor::setupMenus()
     setupBendDownRangeMenu();
     setupMPEGlideRangeMenu();
     setupFilterXpanderModeMenu();
+    setupMPEMatrixMenus();
 
     createMenu();
 }
@@ -199,21 +219,12 @@ void ObxfAudioProcessorEditor::createMenu()
     popupMenus.clear();
     auto *menu = new juce::PopupMenu();
     juce::PopupMenu midiMenu;
+    utils.scanAndUpdateThemes();
     themes = utils.getThemeLocations();
 
     createMidiMapMenu(static_cast<int>(midiStart), midiMenu);
 
     menu->addSubMenu(toOSCase("MIDI Mapping"), midiMenu);
-
-    menu->addItem(toOSCase("MPE Assignments..."), [w = juce::Component::SafePointer(this)]() {
-        if (!w || !w->mpeMatrixEditor)
-            return;
-        w->mpeMatrixEditor->refresh();
-        w->mpeMatrixEditor->setVisible(true);
-        w->mpeMatrixEditor->toFront(true);
-    });
-
-    menu->addSeparator();
 
     {
         juce::PopupMenu themeMenu;
@@ -231,7 +242,10 @@ void ObxfAudioProcessorEditor::createMenu()
             if (theme.locationType != ll && theme.locationType == Utils::LocationType::USER)
             {
                 if (i != 0)
+                {
                     themeMenu.addSeparator();
+                }
+
                 themeMenu.addSectionHeader("User");
             }
 
@@ -543,10 +557,11 @@ void ObxfAudioProcessorEditor::MenuActionCallback(int action)
 
     if (action == MenuAction::DeletePatch)
     {
-        auto llp = processor.lastLoadedPatchNode.lock()->index;
+        auto lsp = processor.lastLoadedPatchNode.lock();
 
-        if (llp >= utils.lastFactoryPatch)
+        if (lsp)
         {
+            auto llp = lsp->index;
             auto &curPatch = utils.patchesAsLinearList[llp];
             const auto patchName = curPatch->file.getFileNameWithoutExtension();
 

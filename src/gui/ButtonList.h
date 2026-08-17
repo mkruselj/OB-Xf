@@ -172,7 +172,8 @@ class ButtonList final : public juce::ComboBox, public HasScaleFactor, public Ha
                 }
             }
 
-            menu.addItem(itemId, getItemText(i), true, (itemId == getSelectedId()));
+            menu.addItem(text, true, (itemId == getSelectedId()),
+                         [this, itemId]() { setSelectedId(itemId, juce::sendNotification); });
         }
 
         if (parameter && owner)
@@ -215,13 +216,11 @@ class ButtonList final : public juce::ComboBox, public HasScaleFactor, public Ha
 
         auto options = juce::PopupMenu::Options().withTargetComponent(this);
 
-        menu.showMenuAsync(options, [this](int result) {
-            if (result > 0)
+        menu.showMenuAsync(options, [safe = juce::Component::SafePointer(this)](int) {
+            if (safe)
             {
-                setSelectedId(result, juce::sendNotification);
+                safe->repaint();
             }
-
-            repaint();
         });
     }
 
@@ -236,6 +235,33 @@ class ButtonList final : public juce::ComboBox, public HasScaleFactor, public Ha
         }
 
         juce::MessageManager::callAsync([this] { showPopup(); });
+    }
+
+    void mouseWheelMove(const juce::MouseEvent &event,
+                        const juce::MouseWheelDetails &wheel) override
+    {
+        if (wheel.deltaY == 0.f)
+        {
+            return;
+        }
+        else
+        {
+            stepMagnitude = (stepMagnitude == 0.f)
+                                ? std::abs(wheel.deltaY)
+                                : std::min(stepMagnitude, std::abs(wheel.deltaY));
+        }
+
+        wheelAccumulator += wheel.deltaY;
+
+        const float sign = std::signbit(wheel.deltaY) ? 1.f : -1.f;
+
+        while (std::abs(wheelAccumulator) >= stepMagnitude * 0.75f)
+        {
+            wheelAccumulator += sign * stepMagnitude;
+            setSelectedItemIndex(
+                juce::jlimit(0, count - 1, getSelectedItemIndex() + static_cast<int>(sign)),
+                juce::sendNotification);
+        }
     }
 
     std::optional<sst::basic_blocks::params::ParamMetaData> getMetadata()
@@ -255,6 +281,8 @@ class ButtonList final : public juce::ComboBox, public HasScaleFactor, public Ha
     juce::AudioProcessorParameterWithID *parameter{nullptr};
     juce::AudioProcessor *owner{nullptr};
     int numColumns = 1;
+    float wheelAccumulator{0.f};
+    float stepMagnitude{0.f};
 };
 
 #endif // OBXF_SRC_GUI_BUTTONLIST_H

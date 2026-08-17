@@ -218,9 +218,13 @@ class ObxfAudioProcessor final : public juce::AudioProcessor,
     MidiHandler &getMidiHandler() { return midiHandler; }
 
     SynthEngine &getSynth() { return synth; }
+    const SynthEngine &getSynth() const { return synth; }
 
     void setMpeEnabled(bool enabled);
     void setMpePitchBendRange(int range);
+
+    void setGlobalPitchBendRange(int range);
+
     void pushMatrixRowUpdate(int idx, const MatrixRow &row);
 
     /* Capacity: enough for real edits onto rows as we drag depth */
@@ -230,6 +234,8 @@ class ObxfAudioProcessor final : public juce::AudioProcessor,
 
     const Program &getActiveProgram() const { return activeProgram; }
     Program &getActiveProgram() { return activeProgram; }
+
+    StateManager &getStateManager() { return *state; };
 
   private:
     void sendChangeMessageWithUndoSuppressed();
@@ -243,7 +249,6 @@ class ObxfAudioProcessor final : public juce::AudioProcessor,
     std::unique_ptr<ParameterCoordinator> paramCoordinator;
     std::unique_ptr<ParameterAlgos> paramAlgos;
     MidiHandler midiHandler;
-    juce::UndoManager undoManager;
 
     std::unique_ptr<StateManager> state;
 

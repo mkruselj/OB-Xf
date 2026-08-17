@@ -23,6 +23,8 @@
 #include <array>
 #include <cstring>
 
+#include <configuration.h>
+
 #ifdef _MSC_VER
 #define OBXF_SRC_PARAMETER_FIFO_H
 #include <cstring>
@@ -35,7 +37,7 @@ constexpr size_t kMaxParamIdLen = 32;
 struct ParameterChange
 {
     char parameterID[kMaxParamIdLen]{};
-    float newValue;
+    float newValue{0.f};
 
     ParameterChange() : parameterID{0}, newValue{0.f} {}
     ParameterChange(const juce::String &id, const float value) : newValue(value)
@@ -62,12 +64,19 @@ template <size_t Capacity> class FIFO
     bool pushParameter(const juce::String &parameterID, float newValue)
     {
         if (abstractFIFO.getFreeSpace() == 0)
+        {
+            OBLOG(params, "Could not get free space in FIFO queue!");
             return false;
+        }
+
         auto scope = abstractFIFO.write(1);
+
         if (scope.blockSize1 > 0)
             buffer[scope.startIndex1] = ParameterChange(parameterID, newValue);
+
         if (scope.blockSize2 > 0)
             buffer[scope.startIndex2] = ParameterChange(parameterID, newValue);
+
         return true;
     }
 

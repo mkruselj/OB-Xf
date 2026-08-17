@@ -19,7 +19,6 @@
 #include "../ObxfEditor.h"
 
 #include "gui/AboutScreen.h"
-#include "gui/MPEMatrix.h"
 #include "gui/SaveDialog.h"
 
 // Theme lifecycle
@@ -62,6 +61,7 @@ void ObxfAudioProcessorEditor::loadTheme(ObxfAudioProcessor &ownerFilter)
     setupMenus();
     restoreComponentParameterValues(parameterValues);
     finalizeThemeLoad(ownerFilter);
+    syncUIFromState();
     resized();
 }
 
@@ -99,6 +99,11 @@ void ObxfAudioProcessorEditor::clearAndResetComponents(ObxfAudioProcessor &owner
     componentByParamID.clear();
     panelGroups.clear();
     updateFilterVisibility = nullptr;
+
+    if (saveDialog)
+    {
+        saveDialog->resetState();
+    }
 
     // Remove all child components that are in componentMap before clearing it
     for (auto &[name, comp] : componentMap)
@@ -197,10 +202,6 @@ void ObxfAudioProcessorEditor::clean()
     {
         addChildComponent(*saveDialog);
     }
-    if (mpeMatrixEditor)
-    {
-        addChildComponent(*mpeMatrixEditor);
-    }
 }
 
 void ObxfAudioProcessorEditor::rebuildComponents(ObxfAudioProcessor &ownerFilter)
@@ -268,17 +269,22 @@ void ObxfAudioProcessorEditor::createComponentsFromXml(const juce::XmlElement *d
 
         if (mpePanel->childGroup)
         {
-            const int mpePanel = showPanelWithFallback(
+            const int mpeDims = showPanelWithFallback(
                 *panelGroups["global"].findPanel("mpeSettingsButton")->childGroup,
                 processor.selectedMPEDimension);
 
             // set initial toggle states for MPE dimension select buttons
             if (auto *b = getWidget<ToggleButton>(panelGroups["global"]
                                                       .findPanel("mpeSettingsButton")
-                                                      ->childGroup->panels[mpePanel]
+                                                      ->childGroup->panels[mpeDims]
                                                       .selectorWidget))
             {
                 b->setToggleState(true, juce::sendNotification);
+            }
+
+            if (!processor.selectedMPEPanel)
+            {
+                mpePanel->childGroup->hideAll();
             }
         }
     }
@@ -293,6 +299,14 @@ void ObxfAudioProcessorEditor::createComponentsFromXml(const juce::XmlElement *d
 
     auto switchPanel = [this](PanelGroup &group, int index, std::function<void()> existingClickCb) {
         group.showPanel(index);
+
+        // Restore child group state if the shown panel has one
+        const auto &panel = group.panels[index];
+
+        if (panel.childGroup)
+        {
+            panel.childGroup->showPanel(panel.childGroup->activePanel);
+        }
 
         if (existingClickCb)
         {
@@ -491,6 +505,8 @@ void ObxfAudioProcessorEditor::createSpecialWidgets(const juce::XmlElement *doc)
         const auto y = child->getIntAttribute("y");
         const auto w = child->getIntAttribute("w");
         const auto h = child->getIntAttribute("h");
+        const auto d = child->getIntAttribute("d");
+        const auto fh = child->getIntAttribute("fh");
         const auto pic = child->getStringAttribute("pic");
         const auto color =
             juce::Colour(child->getStringAttribute("color", "FFFF0000").getHexValue32());
@@ -643,8 +659,10 @@ void ObxfAudioProcessorEditor::createSpecialWidgets(const juce::XmlElement *doc)
             tb->onClick = [this, tb]() {
                 processor.selectedMTSESPPanel = tb->getToggleState();
 
-                auto *masterBGLabel = getWidget<Label>("masterBGLabel");
-                masterBGLabel->setCurrentFrame(processor.selectedMTSESPPanel);
+                if (auto *lbl = getWidget<Label>("masterBGLabel"))
+                {
+                    lbl->setCurrentFrame(processor.selectedMTSESPPanel);
+                }
             };
         }
 
@@ -719,8 +737,10 @@ void ObxfAudioProcessorEditor::createSpecialWidgets(const juce::XmlElement *doc)
             tb->onClick = [this, tb]() {
                 processor.selectedMPEPanel = tb->getToggleState();
 
-                auto *globalBGLabel = getWidget<Label>("globalBGLabel");
-                globalBGLabel->setCurrentFrame(processor.selectedMPEPanel);
+                if (auto *lbl = getWidget<Label>("globalBGLabel"))
+                {
+                    lbl->setCurrentFrame(processor.selectedMPEPanel);
+                }
             };
         }
 
@@ -769,9 +789,97 @@ void ObxfAudioProcessorEditor::createSpecialWidgets(const juce::XmlElement *doc)
             };
         }
 
+        for (const auto &def : mpeMatrixWidgetDefs)
+        {
+            if (name.compare(def.destWidget) == 0)
+            {
+                auto list = addList(x, y, w, h, juce::String{}, def.destName,
+                                    matrixTargetMenuAsset(def.source));
+                auto *raw = storeWidget(componentMap, this, name, std::move(list));
+                auto *bl = static_cast<ButtonList *>(raw);
+
+                bl->onChange = [this, bl, def] {
+                    const int idx = bl->getSelectedItemIndex();
+
+                    MatrixRow before =
+                        processor.getSynth().getMotherboard()->voiceMatrix.rows[def.slotIndex];
+
+                    auto &ph = processor.getParamCoordinator().getParameterUpdateHandler();
+
+                    ph.recordUndoableAction(
+                        [this, def, before, safe = juce::Component::SafePointer(bl)] {
+                            processor.pushMatrixRowUpdate(def.slotIndex, before);
+
+                            if (auto *bl = safe.getComponent())
+                            {
+                                const int beforeIdx =
+                                    matrixTargetToMenuIndex(def.source, before.target);
+                                bl->setSelectedItemIndex(beforeIdx, juce::dontSendNotification);
+                            }
+                        });
+
+                    MatrixRow row = before;
+                    row.source = def.source;
+                    row.target = matrixMenuIndexToTarget(def.source, idx);
+                    processor.pushMatrixRowUpdate(def.slotIndex, row);
+                };
+            }
+
+            if (name.compare(def.amountWidget) == 0)
+            {
+                auto knob = addKnob(x, y, w, h, d, fh, juce::String{}, 0.f, def.amountName,
+                                    useAssetOrDefault(pic, "knob"));
+                auto *raw = storeWidget(componentMap, this, name, std::move(knob));
+                auto *k = static_cast<Knob *>(raw);
+
+                k->setRange(-1.0, 1.0, 0.001);
+                k->customTextFromValue = [](double v) { return juce::String(v * 100.0, 1) + " %"; };
+                k->customValueFromText = [](const juce::String &s) {
+                    return s.trimCharactersAtEnd(" %").getDoubleValue() / 100.0;
+                };
+                k->onDragStart = [this, def, safe = juce::Component::SafePointer(k)] {
+                    MatrixRow before =
+                        processor.getSynth().getMotherboard()->voiceMatrix.rows[def.slotIndex];
+                    auto &ph = processor.getParamCoordinator().getParameterUpdateHandler();
+                    ph.recordUndoableAction([this, def, before, safe] {
+                        processor.pushMatrixRowUpdate(def.slotIndex, before);
+
+                        if (auto *k = safe.getComponent())
+                        {
+                            k->setValue(before.depth, juce::dontSendNotification);
+                        }
+                    });
+                };
+                k->onValueChange = [this, k, def, safe = juce::Component::SafePointer(k)] {
+                    MatrixRow row =
+                        processor.getSynth().getMotherboard()->voiceMatrix.rows[def.slotIndex];
+
+                    if (!k->isDraggingNow())
+                    {
+                        // wheel tick, or any future keyboard nudge: not covered by a drag bracket
+                        // so bracket this single change on its own
+                        MatrixRow before = row;
+                        auto &ph = processor.getParamCoordinator().getParameterUpdateHandler();
+                        ph.recordUndoableAction([this, def, before, safe] {
+                            processor.pushMatrixRowUpdate(def.slotIndex, before);
+
+                            if (auto *k = safe.getComponent())
+                            {
+                                k->setValue(before.depth, juce::dontSendNotification);
+                            }
+                        });
+                    }
+
+                    row.depth = static_cast<float>(k->getValue());
+                    processor.pushMatrixRowUpdate(def.slotIndex, row);
+                };
+            }
+        }
+
         if (name == "mpeGlideRangeMenu")
         {
-            auto btn = addList(x, y, w, h, juce::String{}, Name::MPEGlideRange, "menu-pitch-bend");
+            auto btn =
+                addList(x, y, w, h, juce::String{}, Name::MPEGlideRange, "menu-mpe-pitch-bend");
             auto *raw = storeWidget(componentMap, this, name, std::move(btn));
             auto *tb = static_cast<ButtonList *>(raw);
 
@@ -780,6 +888,15 @@ void ObxfAudioProcessorEditor::createSpecialWidgets(const juce::XmlElement *doc)
 
                 if (val > -1)
                 {
+                    const auto before = processor.getMidiHandler().mpePitchBendRange.load();
+
+                    auto &ph = processor.getParamCoordinator().getParameterUpdateHandler();
+
+                    ph.recordUndoableAction([this, tb, before] {
+                        processor.setMpePitchBendRange(before);
+                        tb->setSelectedItemIndex(before, juce::dontSendNotification);
+                    });
+
                     processor.setMpePitchBendRange(val);
                 }
             };
@@ -793,6 +910,19 @@ void ObxfAudioProcessorEditor::createSpecialWidgets(const juce::XmlElement *doc)
             auto *tb = static_cast<ToggleButton *>(raw);
 
             tb->setToggleState(processor.dynamicMTSESP.load(), juce::dontSendNotification);
+
+            tb->onClick = [this, tb]() {
+                const bool newState = tb->getToggleState();
+                const bool before = processor.dynamicMTSESP.load();
+
+                processor.getParamCoordinator().getParameterUpdateHandler().recordUndoableAction(
+                    [this, tb, before] {
+                        processor.dynamicMTSESP.store(before);
+                        tb->setToggleState(before, juce::dontSendNotification);
+                    });
+
+                processor.dynamicMTSESP.store(newState);
+            };
 
             continue;
         }
@@ -810,6 +940,15 @@ void ObxfAudioProcessorEditor::createSpecialWidgets(const juce::XmlElement *doc)
                 const bool locked = tb->getToggleState();
                 auto &ph = processor.getParamCoordinator().getParameterUpdateHandler();
                 const auto hq = ph.getParameter(ID::HQMode);
+
+                const bool beforeLocked = processor.lockHighQuality.load();
+                const float beforeLockedHQ = processor.lockedHQ;
+
+                ph.recordUndoableAction([this, tb, beforeLocked, beforeLockedHQ] {
+                    processor.lockHighQuality.store(beforeLocked);
+                    processor.lockedHQ = beforeLockedHQ;
+                    tb->setToggleState(beforeLocked, juce::dontSendNotification);
+                });
 
                 processor.lockHighQuality.store(locked);
 
@@ -836,6 +975,18 @@ void ObxfAudioProcessorEditor::createSpecialWidgets(const juce::XmlElement *doc)
                 auto &ph = processor.getParamCoordinator().getParameterUpdateHandler();
                 const auto pbDown = ph.getParameter(ID::BendDownRange);
                 const auto pbUp = ph.getParameter(ID::BendUpRange);
+
+                const bool beforeLocked = processor.lockPitchBend.load();
+                const float beforeLockedPBDown = processor.lockedPBDownRange;
+                const float beforeLockedPBUp = processor.lockedPBUpRange;
+
+                ph.recordUndoableAction(
+                    [this, tb, beforeLocked, beforeLockedPBDown, beforeLockedPBUp] {
+                        processor.lockPitchBend.store(beforeLocked);
+                        processor.lockedPBDownRange = beforeLockedPBDown;
+                        processor.lockedPBUpRange = beforeLockedPBUp;
+                        tb->setToggleState(beforeLocked, juce::dontSendNotification);
+                    });
 
                 processor.lockPitchBend.store(locked);
 
@@ -1131,37 +1282,38 @@ std::unique_ptr<Knob> ObxfAudioProcessorEditor::addKnob(int x, int y, int w, int
             knobAttachments.emplace_back(
                 new KnobAttachment(paramCoordinator.getParameterUpdateHandler(), param, *knob));
         }
-
-        knob->setSliderStyle(juce::Slider::RotaryVerticalDrag);
-
-        if (d > 0)
-        {
-            knob->setBounds(transformBounds(x, y, d, d));
-            if (w > 0 && h > 0 && w > h)
-            {
-                knob->setSliderStyle(juce::Slider::RotaryHorizontalDrag);
-            }
-        }
-        else if (w > 0 && h > 0)
-        {
-            knob->setBounds(transformBounds(x, y, w, h));
-
-            if (w > h)
-            {
-                knob->setSliderStyle(juce::Slider::RotaryHorizontalDrag);
-            }
-        }
-        else
-        {
-            knob->setBounds(transformBounds(x, y, defKnobDiameter, defKnobDiameter));
-        }
-
-        knob->setTextBoxStyle(Knob::NoTextBox, true, 0, 0);
-        knob->setRange(0, 1);
-        knob->setTextBoxIsEditable(false);
-        knob->setDoubleClickReturnValue(true, defval, juce::ModifierKeys::noModifiers);
-        knob->setTitle(name);
     }
+
+    knob->setSliderStyle(juce::Slider::RotaryVerticalDrag);
+
+    if (d > 0)
+    {
+        knob->setBounds(transformBounds(x, y, d, d));
+        if (w > 0 && h > 0 && w > h)
+        {
+            knob->setSliderStyle(juce::Slider::RotaryHorizontalDrag);
+        }
+    }
+    else if (w > 0 && h > 0)
+    {
+        knob->setBounds(transformBounds(x, y, w, h));
+
+        if (w > h)
+        {
+            knob->setSliderStyle(juce::Slider::RotaryHorizontalDrag);
+        }
+    }
+    else
+    {
+        knob->setBounds(transformBounds(x, y, defKnobDiameter, defKnobDiameter));
+    }
+
+    knob->setRange(0, 1);
+    knob->setTextBoxStyle(Knob::NoTextBox, true, 0, 0);
+    knob->setTextBoxIsEditable(false);
+    knob->setDoubleClickReturnValue(true, defval, juce::ModifierKeys::noModifiers);
+    knob->setName(name);
+    knob->setTitle(name);
 
     addAndMakeVisible(*knob);
     return knob;
@@ -1197,6 +1349,7 @@ std::unique_ptr<ToggleButton> ObxfAudioProcessorEditor::addButton(const int x, c
 
     button->setBounds(transformBounds(x, y, w, h));
     button->setButtonText(name);
+    button->setName(name);
     button->setTitle(name);
     button->setTriggeredOnMouseDown(true);
 
@@ -1222,8 +1375,10 @@ std::unique_ptr<MultiStateButton> ObxfAudioProcessorEditor::addMultiStateButton(
         }
 
         button->setBounds(transformBounds(x, y, w, h));
-        button->setTitle(name);
     }
+
+    button->setName(name);
+    button->setTitle(name);
 
     addAndMakeVisible(button);
 
@@ -1267,6 +1422,7 @@ std::unique_ptr<ImageMenu> ObxfAudioProcessorEditor::addMenu(const int x, const 
 
     menu->setBounds(transformBounds(x, y, w, h));
     menu->setName("Menu");
+    menu->setTitle("Menu");
 
     auto safeThis = SafePointer(this);
     menu->onClick = [safeThis]() {

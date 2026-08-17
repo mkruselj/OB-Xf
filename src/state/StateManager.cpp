@@ -84,12 +84,18 @@ void StateManager::getActiveProgramStateOnto(juce::XmlElement &xmlState) const
 bool StateManager::getChunkFromFxpData(const void *data, size_t dataSize, const void *&outChunkData,
                                        int &outChunkSize)
 {
-    if (dataSize < 28)
+    if (dataSize < static_cast<int>(sizeof(fxProgramSet)))
     {
         return false;
     }
 
-    const auto set = static_cast<const fxSet *>(data);
+    const auto set = static_cast<const fxProgramSet *>(data);
+    const int32_t chunkSize = fxbSwap(set->chunkSize);
+
+    if (chunkSize < 0)
+    {
+        return false;
+    }
 
     if ((!compareMagic(set->chunkMagic, "CcnK")) || fxbSwap(set->version) > fxbVersionNum)
     {
@@ -98,15 +104,14 @@ bool StateManager::getChunkFromFxpData(const void *data, size_t dataSize, const 
 
     if (compareMagic(set->fxMagic, "FPCh"))
     {
-        const auto *const cset = static_cast<const fxProgramSet *>(data);
-        const size_t chunkSize = static_cast<size_t>(fxbSwap(cset->chunkSize));
+        const size_t chunkSize = static_cast<size_t>(fxbSwap(set->chunkSize));
 
         if (chunkSize + sizeof(fxProgramSet) - 8 > dataSize)
         {
             return false;
         }
 
-        outChunkData = cset->chunk;
+        outChunkData = set->chunk;
         outChunkSize = static_cast<int>(chunkSize);
 
         return true;
@@ -193,6 +198,7 @@ void StateManager::setPluginStateInformation(const void *data, int sizeInBytes)
         OBLOG(state, "Streaming version: " << ver << " (" << verNo << ")");
 
         auto pnode = xmlState->getChildByName("program");
+
         if (!pnode)
         {
             OBLOG(state, "No program element found!");
@@ -203,7 +209,12 @@ void StateManager::setPluginStateInformation(const void *data, int sizeInBytes)
 
         if (auto desp = xmlState->getChildByName(S("dawExtraState")))
         {
-            dawExtraState.fromElement(desp->getFirstChildElement());
+            auto el = desp->getFirstChildElement();
+
+            if (el)
+            {
+                dawExtraState.fromElement(el);
+            }
         }
 
         audioProcessor->processActiveProgramChanged();

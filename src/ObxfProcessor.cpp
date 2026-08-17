@@ -38,7 +38,8 @@ ObxfAudioProcessor::ObxfAudioProcessor()
       utils(std::make_unique<Utils>()),
       paramCoordinator(std::make_unique<ParameterCoordinator>(*this, *this, *this, synth)),
       paramAlgos(std::make_unique<ParameterAlgos>(*paramCoordinator, *utils)),
-      midiHandler(synth, bindings, *paramCoordinator), state(std::make_unique<StateManager>(this))
+      midiHandler(synth, bindings, *paramCoordinator, *this),
+      state(std::make_unique<StateManager>(this))
 {
     OBLOG(general, "OB-Xf startup, version "
                        << sst::plugininfra::VersionInformation::project_version_and_hash);
@@ -70,9 +71,11 @@ void ObxfAudioProcessor::prepareToPlay(const double sampleRate, const int /*samp
 {
     midiHandler.prepareToPlay();
 
-    paramCoordinator->getParameterUpdateHandler().setSuppressGestureToUndo(true);
-    paramCoordinator->getParameterUpdateHandler().updateParameters(true);
-    paramCoordinator->getParameterUpdateHandler().setSuppressGestureToUndo(false);
+    auto &ph = paramCoordinator->getParameterUpdateHandler();
+
+    ph.setSuppressGestureToUndo(true);
+    ph.updateParameters(true);
+    ph.setSuppressGestureToUndo(false);
 
     synth.setSampleRate(static_cast<float>(sampleRate));
     midiHandler.setSampleRate(sampleRate);
@@ -160,13 +163,22 @@ void ObxfAudioProcessor::processBlock(juce::AudioBuffer<float> &buffer,
             midiHandler.processMidiPerSample(&it, midiMessages, samplePos);
             hasMidiMessage = (it != midiMessages.end());
         }
-        midiHandler.processLags();
 
+        midiHandler.processLags();
         synth.processSample(channelData1 + samplePos, channelData2 + samplePos);
+
         ++samplePos;
     }
 
     assert(!hasMidiMessage);
+
+    // Consume any events timestamped at or beyond the block end.
+    // This should never happen in a well-behaving host!
+    while (hasMidiMessage)
+    {
+        midiHandler.processMidiPerSample(&it, midiMessages, samplePos);
+        hasMidiMessage = (it != midiMessages.end());
+    }
 
     if (uiState.editorAttached)
     {
@@ -235,8 +247,7 @@ void ObxfAudioProcessor::setCurrentProgram(const int index)
     }
 
     if (index < 0 || index > utils->lastFactoryPatch + 1 ||
-        (size_t)index > utils->patchesAsLinearList.size() + 1)
-    {
+        (size_t)index > utils->patchesAsLinearList.size())
         return;
     }
 
@@ -265,15 +276,20 @@ const juce::String ObxfAudioProcessor::getProgramName(const int index)
 void ObxfAudioProcessor::applyActiveProgramValuesToJUCEParameters()
 {
     juce::ScopedValueSetter<bool> svs(isHostAutomatedChange, false);
-    if (!paramCoordinator->getParameterUpdateHandler().isFIFOClear())
+
+    auto &ph = paramCoordinator->getParameterUpdateHandler();
+
+    if (!ph.isFIFOClear())
     {
         OBLOG(params, "Deferring applying for update");
         juce::Timer::callAfterDelay(50, [this]() { applyActiveProgramValuesToJUCEParameters(); });
         return;
     }
 
-    paramCoordinator->getParameterUpdateHandler().setSuppressGestureToUndo(true);
+    ph.setSuppressGestureToUndo(true);
+
     const Program &prog = activeProgram;
+
     for (auto *param : ObxfParams(*this))
     {
         if (param)
@@ -284,16 +300,19 @@ void ObxfAudioProcessor::applyActiveProgramValuesToJUCEParameters()
                 (it != prog.values.end()) ? it->second.load() : param->meta.defaultVal;
 
             auto v = param->convertTo0to1(param->get());
+
             if (v != value)
             {
-                param->beginChangeGesture();
                 param->setValueNotifyingHost(value);
-                param->endChangeGesture();
             }
         }
     }
 
-    paramCoordinator->getParameterUpdateHandler().setSuppressGestureToUndo(false);
+    updateHostDisplay(
+        juce::AudioProcessor::ChangeDetails().withProgramChanged(true).withNonParameterStateChanged(
+            true));
+
+    ph.setSuppressGestureToUndo(false);
 }
 
 void ObxfAudioProcessor::processActiveProgramChanged()
@@ -304,33 +323,33 @@ void ObxfAudioProcessor::processActiveProgramChanged()
 
 void ObxfAudioProcessor::sendChangeMessageWithUndoSuppressed()
 {
+    auto &ph = paramCoordinator->getParameterUpdateHandler();
+
     if (juce::MessageManager::existsAndIsCurrentThread())
     {
         // we can trigger the listeners synchronously
-        paramCoordinator->getParameterUpdateHandler().setSuppressGestureToUndo(true);
+        ph.setSuppressGestureToUndo(true);
         sendSynchronousChangeMessage();
-        paramCoordinator->getParameterUpdateHandler().setSuppressGestureToUndo(false);
+        ph.setSuppressGestureToUndo(false);
     }
     else
     {
         // We know the message queue is ordered so this should toggle
         // around the send change message.
-        juce::MessageManager::callAsync([this]() {
-            paramCoordinator->getParameterUpdateHandler().setSuppressGestureToUndo(true);
-        });
+        juce::MessageManager::callAsync([&ph]() { ph.setSuppressGestureToUndo(true); });
         sendChangeMessage();
-        juce::MessageManager::callAsync([this]() {
-            paramCoordinator->getParameterUpdateHandler().setSuppressGestureToUndo(false);
-        });
+        juce::MessageManager::callAsync([&ph]() { ph.setSuppressGestureToUndo(false); });
     }
 }
 
+#ifndef OBXF_HEADLESS
 bool ObxfAudioProcessor::hasEditor() const { return true; }
 
 juce::AudioProcessorEditor *ObxfAudioProcessor::createEditor()
 {
     return new ObxfAudioProcessorEditor(*this);
 }
+#endif
 
 void ObxfAudioProcessor::setEngineParameterValue(const juce::String &paramId, float newValue,
                                                  bool notifyToHost)
@@ -356,10 +375,12 @@ void ObxfAudioProcessor::getStateInformation(juce::MemoryBlock &destData)
 
 void ObxfAudioProcessor::setStateInformation(const void *data, const int sizeInBytes)
 {
-    paramCoordinator->getParameterUpdateHandler().setSuppressGestureToUndo(true);
+    auto &ph = paramCoordinator->getParameterUpdateHandler();
+
+    ph.setSuppressGestureToUndo(true);
     state->setPluginStateInformation(data, sizeInBytes);
     state->applyDAWExtraStateToInstance();
-    paramCoordinator->getParameterUpdateHandler().setSuppressGestureToUndo(false);
+    ph.setSuppressGestureToUndo(false);
 
     auto pn = activeProgram.getName();
 
@@ -403,30 +424,28 @@ void ObxfAudioProcessor::resetLastLoadedProgramTo(int idx)
 
 void ObxfAudioProcessor::initializeLockCallbacks()
 {
-    auto &handler = paramCoordinator->getParameterUpdateHandler();
+    auto &ph = paramCoordinator->getParameterUpdateHandler();
 
-    handler.addParameterCallback(ID::HQMode, "LockSync", [this](float value, bool) {
+    ph.addParameterCallback(ID::HQMode, "LOCK", [this](float value, bool) {
         if (lockHighQuality.load())
         {
             lockedHQ = (value >= 0.5f);
         }
     });
 
-    handler.addParameterCallback(ID::BendUpRange, "LockSync", [this](float value, bool) {
+    ph.addParameterCallback(ID::BendUpRange, "LOCK", [this, &ph](float value, bool) {
         if (lockPitchBend.load())
         {
-            auto *param =
-                paramCoordinator->getParameterUpdateHandler().getParameter(ID::BendUpRange);
+            auto *param = ph.getParameter(ID::BendUpRange);
             if (param)
                 lockedPBUpRange = static_cast<int>(param->convertFrom0to1(value));
         }
     });
 
-    handler.addParameterCallback(ID::BendDownRange, "LockSync", [this](float value, bool) {
+    ph.addParameterCallback(ID::BendDownRange, "LOCK", [this, &ph](float value, bool) {
         if (lockPitchBend.load())
         {
-            auto *param =
-                paramCoordinator->getParameterUpdateHandler().getParameter(ID::BendDownRange);
+            auto *param = ph.getParameter(ID::BendDownRange);
             if (param)
                 lockedPBDownRange = static_cast<int>(param->convertFrom0to1(value));
         }
@@ -488,6 +507,22 @@ void ObxfAudioProcessor::initializeCallbacks()
 
 void ObxfAudioProcessor::mutatePatch()
 {
+    std::vector<std::pair<juce::String, float>> before;
+    before.reserve(activeProgram.values.size());
+
+    for (auto &p : activeProgram.values)
+    {
+        before.emplace_back(p.first, p.second.load());
+    }
+
+    paramCoordinator->getParameterUpdateHandler().recordUndoableAction([this, before] {
+        for (auto &[id, val] : before)
+            activeProgram.setValueById(id, val);
+
+        processActiveProgramChanged();
+        sendChangeMessage();
+    });
+
     paramAlgos->mutate(activeProgram, mutateSections);
     processActiveProgramChanged();
     sendChangeMessage();
@@ -517,12 +552,34 @@ void ObxfAudioProcessor::setMpeEnabled(bool enabled)
 {
     midiHandler.mpeEnabled.store(enabled);
     synth.getMotherboard()->mpeEnabled = enabled;
+
+    // reset MPE pitch and timbre when disabling MPE
+    // else this would only reset on note release, which is uncool
+    if (!enabled)
+    {
+        synth.processMPEPitch(-1, 0.f);
+        synth.processMPETimbre(-1, 0.f);
+    }
+
+    sendChangeMessage();
 }
 
 void ObxfAudioProcessor::setMpePitchBendRange(int range)
 {
     midiHandler.mpePitchBendRange.store(range);
     synth.getMotherboard()->mpePitchBendRange = range;
+
+    sendChangeMessage();
+}
+
+void ObxfAudioProcessor::setGlobalPitchBendRange(int range)
+{
+    const int st = std::clamp(range, 0, MAX_BEND_RANGE);
+
+    synth.processBendUpRange(st);
+    synth.processBendDownRange(st);
+
+    sendChangeMessage();
 }
 
 void ObxfAudioProcessor::pushMatrixRowUpdate(int idx, const MatrixRow &row)
